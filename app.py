@@ -13,8 +13,7 @@ import io
 st.set_page_config(
     page_title="VN-MES良率汇总分析工具",
     page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="centered"
 )
 
 # 默认配置（用于云端部署）
