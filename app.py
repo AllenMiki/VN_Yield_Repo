@@ -7,8 +7,6 @@ VN-MES良率汇总分析工具 - Streamlit Web应用
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-import os
-import json
 import io
 
 # 设置页面配置
@@ -19,31 +17,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 基础路径
-BASE_PATH = os.path.dirname(os.path.abspath(__file__))
-
-
-def load_config():
-    """加载或创建配置文件"""
-    config_path = os.path.join(BASE_PATH, "config.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"关注站位": ["初测"], "匹配规则": {"包含匹配": True}}
-
-
-def save_config(config):
-    """保存配置到JSON文件"""
-    config_path = os.path.join(BASE_PATH, "config.json")
-    try:
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        return False
+# 默认配置（用于云端部署）
+DEFAULT_CONFIG = {"关注站位": ["初测"], "匹配规则": {"包含匹配": True}}
 
 
 def load_excel_files(yield_file, product_file, defect_file):
@@ -140,10 +115,10 @@ def match_defect_info(matched_products_df, defect_df):
 def generate_report(filtered_df, result_df):
     """
     生成最终Excel报告（两个Sheet）
+    返回内存中的Excel文件数据
     """
-    # 生成文件名，包含时间戳
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    output_file = os.path.join(BASE_PATH, f"最终良率分析报告_{timestamp}.xlsx")
+    output_filename = f"最终良率分析报告_{timestamp}.xlsx"
     
     # Sheet2列顺序
     sn_columns_order = [
@@ -151,19 +126,24 @@ def generate_report(filtered_df, result_df):
         '不良时间', '不良工站', '不良代码', '不良描述', 'Machine'
     ]
     
-    # 确保Sheet2列顺序
-    if len(result_df) > 0:
-        result_df = result_df[sn_columns_order]
+    # 复制数据避免修改原数据
+    result_df_copy = result_df.copy()
     
-    # 保存到Excel（两个Sheet）
-    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        # Sheet1: 良率汇总 - 直接复制原始数据
+    # 确保Sheet2列顺序
+    if len(result_df_copy) > 0:
+        result_df_copy = result_df_copy[sn_columns_order]
+    
+    # 在内存中生成Excel
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Sheet1: 良率汇总
         filtered_df.to_excel(writer, sheet_name='良率汇总', index=False, engine='openpyxl')
         
         # Sheet2: SN详细信息
-        result_df.to_excel(writer, sheet_name='SN详细信息', index=False, engine='openpyxl')
+        result_df_copy.to_excel(writer, sheet_name='SN详细信息', index=False, engine='openpyxl')
     
-    return output_file
+    output.seek(0)
+    return output, output_filename
 
 
 # ==================== Streamlit 界面 ====================
@@ -253,7 +233,7 @@ st.markdown('<p class="sub-header">高效分析良率数据，匹配产品状态
 
 # ==================== 初始化会话状态 ====================
 if 'config' not in st.session_state:
-    st.session_state['config'] = load_config()
+    st.session_state['config'] = DEFAULT_CONFIG.copy()
 
 if 'stations_list' not in st.session_state:
     # 初始化站位列表为DataFrame格式，便于编辑
@@ -316,7 +296,7 @@ with st.sidebar:
     col_save1, col_save2 = st.columns(2)
     
     with col_save1:
-        if st.button("💾 保存配置", use_container_width=True):
+        if st.button("💾 确认站位配置", use_container_width=True):
             # 从编辑后的DataFrame提取站位列表
             stations_list = edited_df['关注站位'].dropna().tolist()
             stations_list = [s.strip() for s in stations_list if str(s).strip()]
@@ -325,20 +305,17 @@ with st.sidebar:
                 "关注站位": stations_list,
                 "匹配规则": {"包含匹配": st.session_state['use_inclusive_match']}
             }
-            
-            if save_config(st.session_state['config']):
-                st.session_state['stations_list'] = edited_df
-                st.success("✅ 配置已保存到 config.json")
-            else:
-                st.error("❌ 保存配置失败")
+            st.session_state['stations_list'] = edited_df.copy()
+            st.success("✅ 站位配置已更新（仅当前会话有效）")
     
     with col_save2:
-        if st.button("🔄 加载现有配置", use_container_width=True):
-            st.session_state['config'] = load_config()
-            stations = st.session_state['config'].get('关注站位', ["初测"])
-            st.session_state['stations_list'] = pd.DataFrame({"关注站位": stations})
-            st.session_state['use_inclusive_match'] = st.session_state['config'].get('匹配规则', {}).get('包含匹配', True)
+        if st.button("🔄 重置为默认配置", use_container_width=True):
+            st.session_state['config'] = DEFAULT_CONFIG.copy()
+            st.session_state['stations_list'] = pd.DataFrame({"关注站位": ["初测"]})
+            st.session_state['use_inclusive_match'] = True
             st.rerun()
+    
+    st.caption("💡 注意：云端部署无法保存配置到文件，刷新页面将重置")
     
     st.markdown('</div>', unsafe_allow_html=True)
     
@@ -467,12 +444,13 @@ if analyze_button:
             status_text.text("⏳ 正在生成报告...")
             progress_bar.progress(90)
             
-            output_file = generate_report(filtered_df, result_df)
+            report_data, report_filename = generate_report(filtered_df, result_df)
             
             # 在session_state中存储结果
             st.session_state['filtered_df'] = filtered_df
             st.session_state['result_df'] = result_df
-            st.session_state['output_file'] = output_file
+            st.session_state['report_data'] = report_data.getvalue()
+            st.session_state['report_filename'] = report_filename
             
             progress_bar.progress(100)
             status_text.text("✅ 分析完成！")
@@ -546,20 +524,16 @@ if analyze_button:
             col_down1, col_down2 = st.columns(2)
             
             with col_down1:
-                # 下载完整报告
-                with open(output_file, 'rb') as f:
-                    report_data = f.read()
-                
                 st.download_button(
                     label="📥 下载完整报告 (Excel)",
                     data=report_data,
-                    file_name=os.path.basename(output_file),
+                    file_name=report_filename,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
             
             with col_down2:
-                st.markdown(f"📁 报告路径: `{output_file}`")
+                st.markdown(f"📄 文件名: `{report_filename}`")
                 st.markdown(f"⏰ 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             
             st.success("✅ 分析完成！请查看上方报表或下载报告。")
@@ -596,18 +570,14 @@ elif 'filtered_df' in st.session_state and 'result_df' in st.session_state:
         st.info("ℹ️ SN详细信息无数据")
     
     # 显示下载按钮
-    if 'output_file' in st.session_state:
+    if 'report_data' in st.session_state:
         st.markdown("---")
         st.markdown("## 📥 导出报告")
         
-        output_file = st.session_state['output_file']
-        with open(output_file, 'rb') as f:
-            report_data = f.read()
-        
         st.download_button(
             label="📥 下载报告 (Excel)",
-            data=report_data,
-            file_name=os.path.basename(output_file),
+            data=st.session_state['report_data'],
+            file_name=st.session_state['report_filename'],
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
@@ -627,7 +597,7 @@ if 'filtered_df' not in st.session_state:
         <p>请在左侧设置面板中完成以下配置：</p>
         <ul>
             <li><strong>上传数据文件</strong> - 依次上传三个Excel报告文件（良率、产品状态、不良信息）</li>
-            <li><strong>关注站位配置</strong> - 使用表格编辑器添加/删除/修改站位，点击"保存配置"保存到 config.json</li>
+            <li><strong>关注站位配置</strong> - 使用表格编辑器添加/删除/修改站位，点击"确认站位配置"</li>
             <li><strong>匹配规则</strong> - 选择包含匹配或精确匹配</li>
         </ul>
         <p>配置完成后，点击「开始分析」按钮进行分析。</p>
@@ -640,20 +610,12 @@ if 'filtered_df' not in st.session_state:
     config = st.session_state['config']
     stations = config.get('关注站位', [])
     
-    info_col1, info_col2 = st.columns(2)
-    
-    with info_col1:
-        st.markdown("**配置文件路径:**")
-        config_path = os.path.join(BASE_PATH, "config.json")
-        st.code(config_path)
-    
-    with info_col2:
-        st.markdown("**当前关注站位:**")
-        if stations:
-            for station in stations:
-                st.markdown(f"- {station}")
-        else:
-            st.markdown("<无配置>")
+    st.markdown("**当前关注站位:**")
+    if stations:
+        for station in stations:
+            st.markdown(f"- {station}")
+    else:
+        st.markdown("<无配置>")
     
     st.markdown("---")
     
@@ -671,8 +633,8 @@ if 'filtered_df' not in st.session_state:
         **步骤2: 配置站位**
         - 在"关注站位配置"区域编辑站位列表
         - 支持动态添加/删除/修改
-        - 点击"保存配置"保存到 config.json
-        - 点击"加载现有配置"读取已保存的配置
+        - 点击"确认站位配置"应用更改
+        - 点击"重置为默认配置"恢复默认
         """)
     
     with usage_col2:
